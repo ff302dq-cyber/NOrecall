@@ -3,7 +3,8 @@
 
 群聊：群友撤回了“对 Bot 说的话”（@ 了 Bot、带唤醒词、或走了指令）时
 私聊：用户撤回任何一条消息时（私聊里每句话都是对 Bot 说的）
-  1. 发一条“系统报错”（Bot 还没回复时报不报由 error_when_no_reply 决定）（fold_window 秒内的多次撤回折叠成一条，设 0 则每次单独报错）
+  1. 立刻发一条“系统报错”（Bot 还没回复时报不报由 error_when_no_reply 决定；
+     fold_window 秒内同一会话的后续撤回不再重复报，设 0 则每次都报）
   2. Bot 还没回复 -> 直接不回（还没调模型的话连钱都不花）
   3. Bot 已经回复 -> 把 Bot 自己那几条也撤掉（含分段回复）
 兼容消息合并插件：合并后的回复会关联到这一批里的每条原消息，撤其中任意一条都算。
@@ -47,7 +48,7 @@ KEEP_SECONDS = 300  # 记录保留 5 分钟，QQ 撤回窗口只有 2 分钟，�
 GROUP, PRIVATE = "group", "private"
 
 
-@register("astrbot_plugin_recall_sync", "junjun", "消息撤回同步", "1.7.0")
+@register("astrbot_plugin_recall_sync", "junjun", "消息撤回同步", "1.8.0")
 class RecallSync(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -108,7 +109,8 @@ class RecallSync(Star):
         for i in ids:
             self.claimed.add(i)
         if not ids:
-            await asyncio.sleep(float(self._c("lookup_delay", 1.0)))
+            if not any(k in self.recalled for k in keys):
+                await asyncio.sleep(float(self._c("lookup_delay", 0.5)))
             win = dict(p, t_start=t_start or p["t_start"], t_end=now)
             ids = await self._find_bot_msgs(win)
         if p["revoked"]:
@@ -277,16 +279,25 @@ class RecallSync(Star):
 
         # 报错：撤回的是对 Bot 说的话，且是本人撤回（管理员撤别人的默认不报）
         # Bot 还没发出回复时是否报错，由 error_when_no_reply 决定
-        replied = key in self.pending
-        if key in self.woken and (replied or self._c("error_when_no_reply", True)):
-            if operator == user_id or not self._c("ignore_admin_recall", True):
-                self._error_once(key, self_id, kind, tid)
-
-        # 双撤：Bot 已经发出回复的才撤
         p = self.pending.get(key)
+        should_err = (
+            key in self.woken
+            and (p is not None or self._c("error_when_no_reply", True))
+            and (operator == user_id or not self._c("ignore_admin_recall", True))
+        )
+
         if p and p["t_end"] is not None:
+            # 回复已发出：先撤回复（几十毫秒），撤完立刻报错，免得报错被当成回复一起撤掉
             await self._revoke(key, p)
-        # 还在生成或发送中的，交给下面的钩子拦截
+            if should_err:
+                self._error_once(key, self_id, kind, tid)
+        elif p:
+            # 回复正在发送中：等发完、撤掉之后再报错
+            if should_err:
+                p["error_after"] = (key, self_id, kind, tid)
+        elif should_err:
+            # 还没回复：直接报错，回复会在发送前被拦下
+            self._error_once(key, self_id, kind, tid)
 
     # ---------- 自检：看协议端支不支持需要的接口 ----------
 
@@ -394,8 +405,13 @@ class RecallSync(Star):
         asyncio.create_task(self._claim_later(keys, p))
 
     async def _claim_later(self, keys, p):
-        await asyncio.sleep(float(self._c("lookup_delay", 1.0)))
+        recalled_already = any(k in self.recalled for k in keys)
+        if not recalled_already:
+            await asyncio.sleep(float(self._c("lookup_delay", 0.5)))
         found = await self._find_bot_msgs(p)
+        if not found and any(k in self.recalled for k in keys):
+            await asyncio.sleep(0.3)  # 刚发出去历史里可能还没有，补查一次
+            found = await self._find_bot_msgs(p)
         p["ids"] = p["ids"] or found
         hit = next((k for k in keys if k in self.recalled), None)
         if hit:
@@ -412,8 +428,8 @@ class RecallSync(Star):
                 p["self_id"], "get_friend_msg_history", user_id=int(p["tid"]), count=count
             )
         msgs = ret.get("messages", []) if isinstance(ret, dict) else []
-        lo = p["t_start"] - 2
-        hi = (p["t_end"] or time.time()) + 2
+        lo = p["t_start"] - 1
+        hi = (p["t_end"] or time.time()) + 1
         ids = []
         for m in msgs:
             sender = (m.get("sender") or {}).get("user_id", m.get("user_id", ""))
@@ -434,46 +450,41 @@ class RecallSync(Star):
         p["revoked"] = True
         ids = p["ids"] or await self._find_bot_msgs(p)
         p["ids"] = ids
-        ok = 0
-        for i in ids:
-            ret = await self._call(p["self_id"], "delete_msg", message_id=int(i))
-            if ret is not None:
-                ok += 1
+        # 几条回复同时撤，不排队
+        results = await asyncio.gather(
+            *(self._call(p["self_id"], "delete_msg", message_id=int(i)) for i in ids)
+        )
         if self._c("debug", False):
+            ok = sum(1 for r in results if r is not None)
             logger.info(f"[RecallSync] revoked {ok}/{len(ids)} bot message(s) for {key}")
+        pending_err = p.pop("error_after", None)
+        if pending_err:
+            self._error_once(*pending_err)
 
     # ---------- 6. 伪报错（可折叠） ----------
 
     def _fold_error(self, self_id, kind, tid):
+        """第一次撤回立刻报错；fold_window 秒内同一个会话再撤回就不重复报。"""
         if not self._c("fake_error", True) or not tid:
             return
-        base = f"{self_id}:{kind}:{tid}"
-        if float(self._c("fold_window", 6) or 0) <= 0:
-            fk = f"{base}:{random.getrandbits(32)}"
-            self.fold[fk] = {"n": 1}
-            asyncio.create_task(self._flush(str(self_id), kind, str(tid), fk))
-            return
-        f = self.fold.get(base)
-        if f:
-            f["n"] += 1
-            return
-        self.fold[base] = {"n": 1}
-        asyncio.create_task(self._flush(str(self_id), kind, str(tid), base))
-
-    async def _flush(self, self_id, kind, tid, fk):
         window = float(self._c("fold_window", 6) or 0)
-        await asyncio.sleep(window if window > 0 else 1.0)
-        f = self.fold.pop(fk, None)
-        if not f:
-            return
+        if window > 0:
+            base = f"{self_id}:{kind}:{tid}"
+            now = time.time()
+            if now - self.fold.get(base, 0) < window:
+                return
+            self.fold[base] = now
+        asyncio.create_task(self._send_error(str(self_id), kind, str(tid)))
+
+    async def _send_error(self, self_id, kind, tid):
         tpls = self._c("error_templates", DEFAULT_TEMPLATES) or DEFAULT_TEMPLATES
         trace = "%08x" % random.getrandbits(32)
         try:
             text = random.choice(tpls).format(
-                n=f["n"], trace=trace, time=time.strftime("%H:%M:%S")
+                n=1, trace=trace, time=time.strftime("%H:%M:%S")
             )
         except Exception:
-            text = DEFAULT_TEMPLATES[0].format(n=f["n"], trace=trace)
+            text = DEFAULT_TEMPLATES[0].format(n=1, trace=trace)
 
         if str(self._c("error_style", "forward")) == "forward":
             # 和 AstrBot 超长消息折叠成合并转发的格式一模一样
@@ -501,10 +512,12 @@ class RecallSync(Star):
             ret = await self._call(
                 self_id, "send_private_msg", user_id=int(tid), message=text, auto_escape=True
             )
-        if isinstance(ret, dict) and ret.get("message_id") is not None:
-            eid = str(ret["message_id"])
-            self.error_ids.add(eid)
-            ttl = float(self._c("error_ttl", 0) or 0)
-            if ttl > 0:
-                await asyncio.sleep(ttl)
-                await self._call(self_id, "delete_msg", message_id=int(eid))
+        if isinstance(ret, dict):
+            data = ret.get("data", ret)
+            eid = data.get("message_id") if isinstance(data, dict) else None
+            if eid is not None:
+                self.error_ids.add(str(eid))
+                ttl = float(self._c("error_ttl", 0) or 0)
+                if ttl > 0:
+                    await asyncio.sleep(ttl)
+                    await self._call(self_id, "delete_msg", message_id=int(eid))
