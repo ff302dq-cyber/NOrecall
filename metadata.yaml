@@ -3,4 +3,4 @@ display_name: 消息撤回同步
 desc: 源消息撤回时同步回滚关联回复
 version: v1.8.0
 author: junjun
-repo: ""
+repo: "https://github.com/ff302dq-cyber/NOrecall"

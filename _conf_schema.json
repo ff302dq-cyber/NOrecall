@@ -20,7 +20,7 @@
   "error_when_no_reply": {
     "description": "没回复时撤回也报错",
     "type": "bool",
-    "default": true,
+    "default": false,
     "hint": "Bot 还没发出回复就被撤回时也报错。关掉则静默：不回复也不报错，像什么都没发生。"
   },
   "ignore_admin_recall": {
