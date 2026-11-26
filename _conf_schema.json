@@ -21,7 +21,7 @@
     "description": "没回复时撤回也报错",
     "type": "bool",
     "default": false,
-    "hint": "Bot 还没发出回复就被撤回时也报错。关掉则静默：不回复也不报错，像什么都没发生。"
+    "hint": "Bot 还没发出回复就被撤回时也报错。默认关闭：这种情况静默处理，不回复也不报错，像什么都没发生。"
   },
   "ignore_admin_recall": {
     "description": "管理员撤别人的消息不报错",

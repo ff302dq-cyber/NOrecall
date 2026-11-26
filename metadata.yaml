@@ -1,6 +1,6 @@
 name: astrbot_plugin_recall_sync
 display_name: 消息撤回同步
 desc: 源消息撤回时同步回滚关联回复
-version: v1.8.0
+version: v1.9.1
 author: junjun
-repo: "https://github.com/ff302dq-cyber/NOrecall"
+repo: ""

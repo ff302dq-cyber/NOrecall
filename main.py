@@ -15,10 +15,13 @@ get_group_msg_history / get_friend_msg_history（NapCat 均支持）。
 """
 
 import asyncio
+import contextvars
+import re
 import random
 import sys
 import time
 import types
+from collections import deque
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -43,12 +46,19 @@ DEFAULT_TEMPLATES = [
     "(blockReason: MESSAGE_RECALLED)', 'type': 'upstream_error', 'param': '', 'code': 404}}}}",
 ]
 
+SEND_ACTIONS = {
+    "send_msg", "send_group_msg", "send_private_msg",
+    "send_forward_msg", "send_group_forward_msg", "send_private_forward_msg",
+}
+# 正在发伪报错时置位，发送记录里会打上标记，免得报错被当成回复撤掉
+_SENDING_ERROR = contextvars.ContextVar("recall_sync_sending_error", default=False)
+
 KEEP_SECONDS = 300  # 记录保留 5 分钟，QQ 撤回窗口只有 2 分钟，够用
 
 GROUP, PRIVATE = "group", "private"
 
 
-@register("astrbot_plugin_recall_sync", "junjun", "消息撤回同步", "1.8.0")
+@register("astrbot_plugin_recall_sync", "junjun", "消息撤回同步", "1.9.1")
 class RecallSync(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -62,8 +72,12 @@ class RecallSync(Star):
         self.error_ids = set() # 伪报错自己的消息 id
         self.fold = {}         # "self_id:kind:tid" -> {"n": 次数}
         # 给自己直接发消息、绕开 AstrBot 发送流程的插件（如六爻）用的登记口
+        # 发送记录：每个 Bot 最近发出的消息（谁发的、发到哪、消息 id、引用了哪条）
+        self.sent_log = {}     # self_id -> deque[dict]
         sys.modules["astrbot_recall_sync"] = types.SimpleNamespace(
-            is_recalled=self.is_recalled, register_reply=self.register_reply
+            is_recalled=self.is_recalled,
+            register_reply=self.register_reply,
+            record_send=self._record_send,
         )
 
     # ---------- 对外接口 ----------
@@ -194,7 +208,71 @@ class RecallSync(Star):
     def _remember_client(self, event: AstrMessageEvent):
         bot = getattr(event, "bot", None)
         if bot is not None:
-            self.clients[str(event.get_self_id())] = bot
+            sid = str(event.get_self_id())
+            self.clients[sid] = bot
+            self._hook_client(sid, bot)
+
+    @staticmethod
+    def _hook_client(sid, bot):
+        """在 OneBot 客户端的发送口挂一个记录器。AstrBot 正常回复、插件自己直接调接口、
+        event.send，最后都走 bot._api.call_action，所以在这里能记下每一条 Bot 消息的 id。"""
+        api = getattr(bot, "_api", None) or getattr(bot, "api", None)
+        if api is None or getattr(api, "_recall_sync_hooked", False):
+            return
+        orig = api.call_action
+
+        async def call_action(action=None, **params):
+            ret = await orig(action=action, **params)
+            if action in SEND_ACTIONS:
+                rec = getattr(sys.modules.get("astrbot_recall_sync"), "record_send", None)
+                if rec:
+                    try:
+                        rec(str(params.get("self_id") or sid), action, params, ret)
+                    except Exception:
+                        pass
+            return ret
+
+        try:
+            api.call_action = call_action
+            api._recall_sync_hooked = True
+        except Exception:
+            pass
+
+    @staticmethod
+    def _reply_target(message):
+        """从发出去的消息里找出它引用（回复）的是哪条消息。"""
+        if isinstance(message, str):
+            m = re.search(r"\[CQ:reply,(?:[^\]]*?,)?id=(-?\d+)", message)
+            return m.group(1) if m else None
+        if isinstance(message, dict):
+            message = [message]
+        if isinstance(message, (list, tuple)):
+            for seg in message:
+                if isinstance(seg, dict) and seg.get("type") == "reply":
+                    rid = (seg.get("data") or {}).get("id")
+                    return str(rid) if rid is not None else None
+        return None
+
+    def _record_send(self, self_id, action, params, ret):
+        data = ret.get("data", ret) if isinstance(ret, dict) else None
+        mid = data.get("message_id") if isinstance(data, dict) else None
+        if mid is None:
+            return
+        if params.get("group_id") or params.get("message_type") == "group":
+            kind, tid = GROUP, str(params.get("group_id"))
+        else:
+            kind, tid = PRIVATE, str(params.get("user_id"))
+        log = self.sent_log.setdefault(str(self_id), deque(maxlen=300))
+        log.append({
+            "t": time.time(),
+            "kind": kind,
+            "tid": tid,
+            "mid": str(mid),
+            "reply_to": self._reply_target(params.get("message")),
+            "err": bool(_SENDING_ERROR.get()),
+        })
+        if _SENDING_ERROR.get():
+            self.error_ids.add(str(mid))
 
     def _mark_woken(self, event: AstrMessageEvent):
         if self._is_wake(event):
@@ -280,9 +358,23 @@ class RecallSync(Star):
         # 报错：撤回的是对 Bot 说的话，且是本人撤回（管理员撤别人的默认不报）
         # Bot 还没发出回复时是否报错，由 error_when_no_reply 决定
         p = self.pending.get(key)
+        # 引用了被撤回消息的 Bot 回复（forw、引用回复等），不管走的哪条发送路径，直接撤
+        quoted = [
+            e["mid"] for e in self.sent_log.get(self_id, ())
+            if e["reply_to"] == mid and not e["err"] and e["mid"] not in self.error_ids
+        ]
+        if quoted and not (p and p["t_end"] is not None):
+            self.claimed.update(quoted)
+            await asyncio.gather(
+                *(self._call(self_id, "delete_msg", message_id=int(i)) for i in quoted)
+            )
+            if self._c("debug", False):
+                logger.info(f"[RecallSync] revoked {len(quoted)} quoting message(s) for {key}")
+        if p and quoted:
+            p["ids"].extend(i for i in quoted if i not in p["ids"])
         should_err = (
             key in self.woken
-            and (p is not None or self._c("error_when_no_reply", True))
+            and (p is not None or quoted or self._c("error_when_no_reply", False))
             and (operator == user_id or not self._c("ignore_admin_recall", True))
         )
 
@@ -296,7 +388,7 @@ class RecallSync(Star):
             if should_err:
                 p["error_after"] = (key, self_id, kind, tid)
         elif should_err:
-            # 还没回复：直接报错，回复会在发送前被拦下
+            # 还没回复（或者引用回复已经撤掉）：直接报错
             self._error_once(key, self_id, kind, tid)
 
     # ---------- 自检：看协议端支不支持需要的接口 ----------
@@ -418,6 +510,21 @@ class RecallSync(Star):
             await self._revoke(hit, p)
 
     async def _find_bot_msgs(self, p):
+        # 1) 发送记录：时间精确到毫秒，不会误认
+        lo = p["t_start"] - 0.3
+        hi = (p["t_end"] or time.time()) + 0.3
+        ids = []
+        for e in self.sent_log.get(p["self_id"], ()):
+            if (
+                e["kind"] == p["kind"] and e["tid"] == p["tid"]
+                and lo <= e["t"] <= hi and not e["err"]
+                and e["mid"] not in self.claimed and e["mid"] not in self.error_ids
+            ):
+                ids.append(e["mid"])
+        if ids:
+            self.claimed.update(ids)
+            return ids
+        # 2) 兜底：翻群/私聊历史
         count = int(self._c("history_count", 20))
         if p["kind"] == GROUP:
             ret = await self._call(
@@ -477,6 +584,7 @@ class RecallSync(Star):
         asyncio.create_task(self._send_error(str(self_id), kind, str(tid)))
 
     async def _send_error(self, self_id, kind, tid):
+        _SENDING_ERROR.set(True)  # 只影响这个任务，发出的报错不会被当成回复
         tpls = self._c("error_templates", DEFAULT_TEMPLATES) or DEFAULT_TEMPLATES
         trace = "%08x" % random.getrandbits(32)
         try:
