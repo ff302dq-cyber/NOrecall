@@ -1,0 +1,80 @@
+{
+  "enable": {
+    "description": "启用撤回同步",
+    "type": "bool",
+    "default": true
+  },
+  "private_enable": {
+    "description": "私聊也生效（私聊撤回任何消息都报错，有回复就撤回复）",
+    "type": "bool",
+    "default": true
+  },
+  "fake_error": {
+    "description": "撤回对 Bot 说的话时发一条报错（群聊：@Bot / 唤醒词 / 指令；私聊：任何消息）",
+    "type": "bool",
+    "default": true
+  },
+  "error_style": {
+    "description": "报错样式：forward = 仿 AstrBot 真实报错折叠成合并转发；plain = 普通文字消息",
+    "type": "string",
+    "default": "forward",
+    "options": [
+      "forward",
+      "plain"
+    ]
+  },
+  "forward_nickname": {
+    "description": "合并转发里显示的发送者昵称（AstrBot 真实报错用的是 AstrBot）",
+    "type": "string",
+    "default": "AstrBot"
+  },
+  "error_when_no_reply": {
+    "description": "Bot 还没发出回复时撤回也报错。关掉则静默：不回复也不报错",
+    "type": "bool",
+    "default": true
+  },
+  "ignore_admin_recall": {
+    "description": "管理员撤回别人的消息时不报错（Bot 的回复照样撤）",
+    "type": "bool",
+    "default": true
+  },
+  "fold_window": {
+    "description": "折叠窗口（秒）：这段时间内的多次撤回合并成一条报错，0 = 每次撤回都单独报错",
+    "type": "int",
+    "default": 6
+  },
+  "error_templates": {
+    "description": "报错模板，随机挑一条。可用占位符 {n} 次数、{trace} 随机追踪号、{time} 时间；字面的花括号要写成 {{ }}",
+    "type": "list",
+    "default": [
+      "LLM 响应错误: All chat models failed: BadRequestError: Error code: 400 - {{'error': {{'message': 'Source message was withdrawn by sender. (blockReason: SOURCE_WITHDRAWN)', 'type': 'upstream_error', 'param': '', 'code': 400}}}}",
+      "LLM 响应错误: All chat models failed: BadRequestError: Error code: 400 - {{'error': {{'message': 'Context message not found or has been revoked. (request_id: {trace})', 'type': 'invalid_request_error', 'param': 'messages', 'code': 400}}}}",
+      "LLM 响应错误: All chat models failed: NotFoundError: Error code: 404 - {{'error': {{'message': 'Referenced message is no longer available. (blockReason: MESSAGE_RECALLED)', 'type': 'upstream_error', 'param': '', 'code': 404}}}}"
+    ]
+  },
+  "error_ttl": {
+    "description": "报错多少秒后自动撤掉，0 为不撤",
+    "type": "int",
+    "default": 0
+  },
+  "pre_delay_max": {
+    "description": "调模型前随机等待的最长秒数，0 为不等。开了能拦住手快撤回、省调用费",
+    "type": "float",
+    "default": 0
+  },
+  "lookup_delay": {
+    "description": "发送后多久去查 Bot 刚发的消息 id（秒）",
+    "type": "float",
+    "default": 1.0
+  },
+  "history_count": {
+    "description": "查群历史的条数，群很活跃可以调大",
+    "type": "int",
+    "default": 20
+  },
+  "debug": {
+    "description": "后台打印调试日志（群里看不到）",
+    "type": "bool",
+    "default": false
+  }
+}
